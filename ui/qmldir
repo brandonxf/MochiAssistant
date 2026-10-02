@@ -1,0 +1,12 @@
+singleton Theme 1.0 Theme.qml
+Axolotl 1.0 Axolotl.qml
+ChatView 1.0 ChatView.qml
+Icon 1.0 Icon.qml
+Sounds 1.0 Sounds.qml
+Spring 1.0 Spring.qml
+Chip 1.0 Chip.qml
+Toggle 1.0 Toggle.qml
+VolumeSlider 1.0 VolumeSlider.qml
+QuestionView 1.0 QuestionView.qml
+TimeView 1.0 TimeView.qml
+SettingsView 1.0 SettingsView.qml

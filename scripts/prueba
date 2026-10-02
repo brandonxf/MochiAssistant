@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""prueba — demostración EN VIVO de Mochi, sin grabar.
+
+Arranca un daemon temporal con datos inventados y una isla en modo demo (la tuya se pausa y se
+restaura sola al terminar), y recorre todas las funciones mientras narra en la terminal.
+
+  prueba                 demostración completa
+  prueba --pausas        espera Enter entre escenas (para explicar en persona)
+  prueba --escena 3      solo una escena (ver --lista)
+  prueba --limpio        usa un espacio de trabajo vacío con fondo propio (en vez de tu escritorio)
+  prueba --silencio      sin sonidos
+  prueba --lista         muestra las escenas
+  prueba --restaurar     rescate: limpia restos de una demostración interrumpida
+"""
+import argparse, atexit, json, os, shutil, signal, socket, subprocess, sys, threading, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BIN = ROOT + '/target/release/'
+UI = ROOT + '/ui'
+STAGE = ROOT + '/scripts/prueba-fondo'
+T = '/tmp/axp'                       # ruta corta: el socket Unix admite solo 108 caracteres
+PIDS = T + '/pids.json'
+RT0 = os.environ.get('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid())
+real_env = dict(os.environ)
+demo_env = dict(os.environ, XDG_RUNTIME_DIR=T + '/rt', XDG_CONFIG_HOME=T + '/cfg', XDG_DATA_HOME=T + '/data', AXOLOTL_DEMO='1', PULSE_SERVER='unix:%s/pulse/native' % RT0)
+DEMO_UI = T + '/ui'
+
+PINK, DIM, BOLD, RST = '\033[38;5;211m', '\033[2m', '\033[1m', '\033[0m'
+def say(msg=''): print(msg, flush=True)
+
+def sh(*a, env=None):
+    return subprocess.run(a, env=env or real_env, capture_output=True, text=True)
+
+# ---------------------------------------------------------------- limpieza / rescate
+procs, state_back = [], {}
+
+def restore(verbose=True):
+    for p in procs:
+        try: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception: pass
+    if os.path.exists(PIDS):                      # restos de una ejecución anterior
+        try:
+            for pg in json.load(open(PIDS)).get('pgids', []):
+                try: os.killpg(pg, signal.SIGTERM)
+                except Exception: pass
+        except Exception: pass
+    ws = state_back.get('ws')
+    if ws: sh('hyprctl', 'dispatch', f'hl.dsp.focus({{ workspace = "{ws}" }})')
+    if state_back.get('island_was_active', True): sh('systemctl', '--user', 'start', 'axolotl-island')
+    shutil.rmtree(T, ignore_errors=True)
+    if verbose: say(f'{DIM}Todo restaurado: tu isla y tu escritorio están como antes.{RST}')
+
+def rescue():
+    restore(verbose=False)
+    sh('systemctl', '--user', 'start', 'axolotl-island')
+    say('Restos limpiados; tu isla está activa.')
+
+# ---------------------------------------------------------------- escenas
+def build_scenes(D):
+    S = []
+    def scene(title, narration):
+        def deco(fn): S.append((title, narration, fn)); return fn
+        return deco
+
+    @scene('Siempre contigo', 'Mochi vive en la esquina de la pantalla: siempre visible, saluda y se abre con un clic.')
+    def _():
+        D.ipc('close'); D.wait(1.2); D.ipc('mood', 'wave', '2000'); D.wait(2.4); D.ipc('open', 'overview'); D.wait(3.2)
+
+    @scene('Tus agentes, a la vista', 'Cada paso de Claude Code y Gemini en vivo. El botón de terminal salta a la ventana de cada sesión.')
+    def _():
+        D.hook('SessionStart', session='demo2', cwd='/home/ana/api-pagos', agent='gemini'); D.hook('UserPromptSubmit'); D.wait(0.8)
+        for tool, inp in (('Read', {'file_path': 'src/pages/Checkout.tsx'}), ('Grep', {'pattern': 'calcularTotal'}), ('Edit', {'file_path': 'src/lib/precios.ts'}),
+                          ('Bash', {'command': 'npm run test'}), ('Edit', {'file_path': 'src/pages/Checkout.tsx'})):
+            D.hook('PreToolUse', tool_name=tool, tool_input=inp); D.wait(1.15)
+        D.wait(1.0)
+
+    @scene('Permisos con un toque', 'Permitir, rechazar o «siempre permitir» (guarda la regla) sin salir de lo que estás haciendo.')
+    def _():
+        sug = [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "npm run *"}], "behavior": "allow", "destination": "localSettings"}]
+        th = D.perm('Bash', {'command': 'npm run build && npm run deploy:staging'}, sug)
+        D.wait(4.6); D.send(type='decide', id=D.pending_id(), decision='allow_always'); th.join(5); D.wait(1.6)
+
+    @scene('Claude te pregunta, tú tocas', 'Cuando Claude te pide elegir, las opciones llegan como botones (también hay «responder en la terminal»).')
+    def _():
+        q = [{"question": "¿A qué entorno quieres desplegar?", "header": "Entorno", "multiSelect": False, "options": [
+            {"label": "Staging", "description": "Pruebas antes de producción"}, {"label": "Producción", "description": "Visible para todos los usuarios"},
+            {"label": "Local", "description": "Solo en esta máquina"}]}]
+        th = D.perm('AskUserQuestion', {'questions': q})
+        D.wait(4.8); D.send(type='decide', id=D.pending_id(), decision='allow', answers={"¿A qué entorno quieres desplegar?": "Staging"}); th.join(5); D.wait(1.4)
+
+    @scene('Si algo falla, Mochi te avisa', 'Un límite de uso o un error: Mochi se pone cansado o triste y la isla te dice qué pasó.')
+    def _():
+        D.hook('StopFailure', error_type='rate_limit', error_message='Rate limit'); D.wait(4.6)
+        D.ipc('close'); D.wait(2.2); D.ipc('open', 'overview'); D.hook('UserPromptSubmit'); D.wait(0.5)
+
+    @scene('Chat con tu suscripción', 'Respuestas en Markdown, botón de copiar, historial, botón de parar, y el portapapeles o la selección como contexto.')
+    def _():
+        for sid, cwd, ag in (('demo1', '/home/ana/tienda-web', 'claude'), ('demo2', '/home/ana/api-pagos', 'gemini')): D.hook('SessionEnd', session=sid, cwd=cwd, agent=ag)
+        D.ipc('open', 'chat'); D.wait(1.6); D.ipc('demoContext', 'Portapapeles', 'def total(items):\n    return sum(i.precio for i in items)\n' * 6); D.wait(4.4)
+
+    @scene('Suelta un archivo y se lo traga', 'Arrastras un archivo hasta Mochi: abre la boca, lo mastica y lo deja adjunto al chat.')
+    def _():
+        D.ipc('close'); D.wait(1.2)
+        D.ipc('dragAt', '420', '40'); D.wait(1.1); D.ipc('dragAt', '330', '90'); D.wait(0.6); D.ipc('dragAt', '230', '120'); D.wait(0.6); D.ipc('dragAt', '150', '125'); D.wait(0.7)
+        D.ipc('dropFile', T + '/informe-ventas.md'); D.wait(3.8)
+
+    @scene('Pomodoro y recordatorios', 'Pomodoro y recordatorios en lenguaje natural («15m llamar al cliente»); al vencer, Mochi te avisa.')
+    def _():
+        D.send(type='pomo', action='start'); D.send(type='timer_add', secs=900, label='Llamar al cliente'); D.send(type='timer_add', secs=2700, label='Estirar las piernas')
+        D.ipc('open', 'time'); D.wait(4.4); D.ipc('testAlarm', 'Llamar al cliente'); D.wait(3.4); D.ipc('dismissAlarm'); D.send(type='pomo', action='stop'); D.wait(0.8)
+
+    @scene('Baila con tu música', 'Cuando suena música Mochi baila, y deja los controles del reproductor a mano.')
+    def _():
+        D.ipc('demoMusic', 'true'); D.ipc('open', 'overview'); D.wait(3.0); D.ipc('close'); D.wait(3.4)
+
+    @scene('Cuando no estás, se duerme', 'Tras un rato sin actividad bosteza y se duerme; despierta en cuanto vuelves.')
+    def _():
+        D.ipc('demoMusic', 'false'); D.wait(0.8); D.ipc('sleep'); D.wait(6.4)
+
+    @scene('Hazlo tuyo', 'Ajustes: sonido, posición, cuándo dormir… y una sección de accesorios con Mochi en grande y cambios en vivo.')
+    def _():
+        D.ipc('wake'); D.ipc('open', 'settings'); D.ipc('settingsPage', 'general'); D.wait(3.0); D.ipc('settingsPage', 'accessories'); D.wait(1.8)
+        for kw in (dict(head='wizard'), dict(face='glasses'), dict(neck='scarf'), dict(acc_color='#a78bfa'), dict(head='crown', face='sunglasses', neck='bowtie', acc_color='#fbbf24'),
+                   dict(head='catears', face='monocle', neck='bell', acc_color='#60a5fa'), dict(head='tophat', face='mustache', neck='scarf', acc_color='auto')):
+            D.send(type='set_config', **kw); D.wait(1.25)
+        D.send(type='set_config', head='none', face='none', neck='none', acc_color='auto'); D.wait(0.8)
+
+    @scene('También en el centro', 'Puedes anclarlo en la esquina o en el centro de la pantalla, siempre pegado al marco de Caelestia.')
+    def _():
+        D.ipc('close'); D.wait(0.6); D.send(type='set_config', position='center'); D.wait(1.6); D.ipc('open', 'overview'); D.wait(3.4); D.ipc('close'); D.wait(1.0)
+        D.send(type='set_config', position='right'); D.wait(1.6)
+
+    @scene('Mochi, siempre contigo', 'Eso es todo: Mochi, tu compañero de Claude Code, siempre a un clic.')
+    def _():
+        D.ipc('close'); D.wait(0.8); D.ipc('mood', 'wave', '3000'); D.wait(4.4)
+    return S
+
+# ---------------------------------------------------------------- contexto de la demostración
+class Demo:
+    def __init__(self, args):
+        self.args = args; self.sock = None; self.state = {}
+    def ipc(self, *a): sh('qs', 'ipc', '-p', DEMO_UI, 'call', 'island', *a, env=demo_env)
+    def hook(self, ev, session='demo1', cwd='/home/ana/tienda-web', agent='claude', **kw):
+        m = {"hook_event_name": ev, "session_id": session, "cwd": cwd, **kw}
+        return subprocess.run([BIN + 'axolotl-hook', '--agent', agent], input=json.dumps(m).encode(), capture_output=True, env=demo_env)
+    def perm(self, tool, tin, sug=None):
+        m = {"hook_event_name": "PermissionRequest", "session_id": "demo1", "cwd": "/home/ana/tienda-web", "tool_name": tool, "tool_input": tin, "permission_suggestions": sug}
+        th = threading.Thread(target=lambda: subprocess.run([BIN + 'axolotl-hook', '--agent', 'claude'], input=json.dumps(m).encode(), capture_output=True, env=demo_env)); th.start(); return th
+    def wait(self, sec):
+        t0 = time.time(); buf = b''
+        while time.time() - t0 < sec:
+            try: buf += self.sock.recv(65536)
+            except Exception: pass
+        for l in buf.split(b'\n'):
+            try:
+                v = json.loads(l)
+                if v.get('type') == 'state': self.state.update(v)
+            except Exception: pass
+    def send(self, **o): self.sock.sendall((json.dumps(o) + '\n').encode())
+    def pending_id(self):
+        for _ in range(10):
+            if self.state.get('pending'): return self.state['pending'][0]['id']
+            self.wait(0.3)
+        return ''
+
+def start(cmd, env, log):
+    p = subprocess.Popen(cmd, env=env, stdout=open(log, 'w'), stderr=subprocess.STDOUT, start_new_session=True); procs.append(p)
+    json.dump({'pgids': [os.getpgid(q.pid) for q in procs]}, open(PIDS, 'w')); return p
+
+def setup(args):
+    shutil.rmtree(T, ignore_errors=True)
+    for d in ('rt', 'cfg/axolotl-notch', 'data/axolotl-notch'): os.makedirs(f'{T}/{d}')
+    wl = os.environ.get('WAYLAND_DISPLAY', 'wayland-1')
+    for name in (wl, 'hypr'):
+        if os.path.exists(f'{RT0}/{name}'): os.symlink(f'{RT0}/{name}', f'{T}/rt/{name}')
+    json.dump({"api_key": "", "model": "claude-sonnet-5-5", "backend": "subscription", "sound": not args.silencio, "volume": 0.6,
+               "head": "none", "face": "none", "neck": "none", "acc_color": "auto", "position": "right", "sleep_minutes": 0, "dance": True,
+               "pomo_work": 25, "pomo_break": 5}, open(T + '/cfg/axolotl-notch/config.json', 'w'))
+    json.dump({"session": None, "messages": [
+        {"role": "user", "text": "¿Cómo ordeno una lista en Python?"},
+        {"role": "assistant", "text": "## Ordenar una lista\n\n- Usa **sorted()** para obtener una copia nueva\n- Usa **.sort()** para ordenar en el sitio\n\n```python\nnums = [3, 1, 2]\nprint(sorted(nums))\n```"}]},
+        open(T + '/data/axolotl-notch/history.json', 'w'))
+    open(T + '/informe-ventas.md', 'w').write('# Informe de ventas\n')
+    shutil.copytree(UI, DEMO_UI)
+
+def main():
+    ap = argparse.ArgumentParser(description='Demostración en vivo de Mochi', add_help=True)
+    ap.add_argument('--pausas', action='store_true'); ap.add_argument('--escena', type=int); ap.add_argument('--limpio', action='store_true')
+    ap.add_argument('--silencio', action='store_true'); ap.add_argument('--lista', action='store_true'); ap.add_argument('--restaurar', action='store_true')
+    args = ap.parse_args()
+    if args.restaurar: rescue(); return
+    D = Demo(args); scenes = build_scenes(D)
+    if args.lista:
+        for i, (t, n, _) in enumerate(scenes, 1): say(f'{PINK}{i:2d}{RST}  {BOLD}{t}{RST}  {DIM}{n}{RST}')
+        return
+    for b in ('axolotl-daemon', 'axolotl-hook'):
+        if not os.path.exists(BIN + b): sys.exit(f'Falta {BIN}{b}. Compílalo con: cd {ROOT} && cargo build --release')
+    if os.path.exists(PIDS): say(f'{DIM}Hay restos de una demostración anterior; limpiando…{RST}'); restore(verbose=False)
+    atexit.register(lambda: restore())
+    for sg in (signal.SIGINT, signal.SIGTERM): signal.signal(sg, lambda *_: sys.exit(130))
+    state_back['island_was_active'] = sh('systemctl', '--user', 'is-active', 'axolotl-island').stdout.strip() == 'active'
+    if args.escena and not 1 <= args.escena <= len(scenes): sys.exit(f'Escena 1-{len(scenes)} (usa --lista)')
+
+    say(f'\n{PINK}●{RST} {BOLD}Mochi — demostración en vivo{RST}   {DIM}(Ctrl-C para parar; tu isla se restaura sola){RST}\n')
+    setup(args)
+    start([BIN + 'axolotl-daemon'], demo_env, T + '/daemon.log'); time.sleep(1)
+    D.sock = socket.socket(socket.AF_UNIX); D.sock.connect(T + '/rt/axolotl.sock'); D.sock.settimeout(0.2); D.sock.sendall(b'{"type":"subscribe"}\n')
+    sh('systemctl', '--user', 'stop', 'axolotl-island')
+    if args.limpio:
+        state_back['ws'] = json.loads(sh('hyprctl', 'activeworkspace', '-j').stdout)['id']
+        start(['qs', '-p', STAGE], real_env, T + '/fondo.log'); time.sleep(2)
+        sh('hyprctl', 'dispatch', 'hl.dsp.focus({ workspace = "9" })'); time.sleep(0.8)
+    start(['qs', '-p', DEMO_UI], demo_env, T + '/isla.log'); time.sleep(4.5)
+
+    todo = [(i, s) for i, s in enumerate(scenes, 1) if not args.escena or i == args.escena]
+    for i, (title, narration, fn) in todo:
+        say(f'{PINK}▶ {i:2d}/{len(scenes)}{RST}  {BOLD}{title}{RST}\n     {DIM}{narration}{RST}')
+        fn()
+        if args.pausas and (i, ) != (todo[-1][0],): input(f'     {DIM}[Enter para continuar]{RST} ')
+    say(f'\n{PINK}✔{RST} Demostración completa.')
+
+if __name__ == '__main__':
+    main()
